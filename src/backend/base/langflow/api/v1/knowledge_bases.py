@@ -824,9 +824,10 @@ async def create_knowledge_base(
             # duplicate is a 409, not a 500.
             await logger.awarning("Concurrent KB create collided for %s: %s", kb_name, exc)
             if kb_path is not None:
-                KBStorageHelper.delete_storage(kb_path, kb_name)
+                await asyncio.shield(asyncio.to_thread(KBStorageHelper.delete_storage, kb_path, kb_name))
             raise HTTPException(status_code=409, detail=f"Knowledge base '{kb_name}' already exists") from exc
         except StorageUnavailableError:
+            # Chroma skips the storage guards that raise this error, so no local path needs cleanup.
             raise
         except Exception as exc:
             await logger.aerror(
@@ -836,7 +837,7 @@ async def create_knowledge_base(
                 exc,
             )
             if kb_path is not None:
-                KBStorageHelper.delete_storage(kb_path, kb_name)
+                await asyncio.shield(asyncio.to_thread(KBStorageHelper.delete_storage, kb_path, kb_name))
             raise HTTPException(
                 status_code=500,
                 detail=(
@@ -868,7 +869,7 @@ async def create_knowledge_base(
     except Exception as e:
         # Clean up if something went wrong
         if kb_path is not None and kb_path.exists():
-            KBStorageHelper.delete_storage(kb_path, kb_name)
+            await asyncio.shield(asyncio.to_thread(KBStorageHelper.delete_storage, kb_path, kb_name))
         await logger.aerror("Error creating knowledge base: %s", e)
         raise HTTPException(status_code=500, detail="Internal error creating knowledge base") from e
 
@@ -2110,8 +2111,11 @@ async def cancel_ingestion(
             raise HTTPException(status_code=400, detail=f"Cannot cancel job with status '{job_status}'")
 
         revoked = await task_service.revoke_task(job.job_id)
-        # Update status immediately so background task can see it
-        await job_service.update_job_status(job.job_id, JobStatus.CANCELLED)
+        # Update status immediately so background task can see it. Stamp the
+        # finish time with it: retention dates an unstamped terminal row from
+        # its creation, which deletes a long-running job the moment it is
+        # cancelled instead of after the configured window.
+        await job_service.update_job_status(job.job_id, JobStatus.CANCELLED, finished_timestamp=True)
 
         # Clean up any partially ingested chunks from this job. Forward the KB's
         # configured backend and its owner's id: remote backends name their

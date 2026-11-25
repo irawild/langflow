@@ -164,6 +164,9 @@ DANGEROUS_ATTRIBUTE_READS: list[tuple[str, str, str]] = [
     ("os", "environ", "os.environ is forbidden — use Langflow's variable/secret service"),
     ("os", "environb", "os.environb is forbidden. Use Langflow's variable/secret service"),
     ("gc", "garbage", "gc.garbage is forbidden in components (server object recovery)"),
+    ("logging", "config", "logging.config is forbidden in components — use logging.getLogger() for logging"),
+    ("unittest.mock", "_get_target", "unittest.mock._get_target is forbidden in components"),
+    ("unittest.mock", "_dot_lookup", "unittest.mock._dot_lookup is forbidden in components"),
     ("os.path", "os", "os.path.os is forbidden in components"),
     ("sys", "modules", "sys.modules is forbidden in components"),
     ("torch.package", "PackageImporter", "torch.package.PackageImporter is forbidden — external code loading"),
@@ -258,6 +261,11 @@ DANGEROUS_ATTR_CALLS: list[tuple[str, str, str]] = [
     ("os", "remove", "os.remove() is forbidden in components"),
     ("os", "rmdir", "os.rmdir() is forbidden in components"),
     ("os", "unlink", "os.unlink() is forbidden in components"),
+    ("os", "link", "os.link() is forbidden in components"),
+    ("os", "symlink", "os.symlink() is forbidden in components"),
+    ("os", "rename", "os.rename() is forbidden in components"),
+    ("os", "renames", "os.renames() is forbidden in components"),
+    ("os", "replace", "os.replace() is forbidden in components"),
     ("subprocess", "run", "subprocess.run() is forbidden"),
     ("subprocess", "call", "subprocess.call() is forbidden"),
     ("subprocess", "Popen", "subprocess.Popen() is forbidden"),
@@ -311,6 +319,24 @@ DANGEROUS_ATTR_CALLS: list[tuple[str, str, str]] = [
     ("pandas.io.pickle", "read_pickle", "pandas.io.pickle.read_pickle() is forbidden — unsafe pickle deserialization"),
     ("pandas.io.api", "read_pickle", "pandas.io.api.read_pickle() is forbidden — unsafe pickle deserialization"),
     ("pandas", "eval", "pandas.eval() is forbidden in components (dynamic code execution)"),
+    # These APIs evaluate strings outside the generated component's AST.
+    *[
+        (module, member, f"{module}.{member}() is forbidden in components (dynamic code execution)")
+        for module, members in (
+            ("jinja2", ("Template", "Environment")),
+            ("jinja2.environment", ("Template", "Environment")),
+            ("jinja2.ext", ("Environment",)),
+            # Generated code can replace the sandbox policy before rendering.
+            ("jinja2.sandbox", ("Environment", "SandboxedEnvironment", "ImmutableSandboxedEnvironment")),
+            ("jinja2.nativetypes", ("Template", "Environment", "NativeTemplate", "NativeEnvironment")),
+            ("sympy", ("sympify", "S", "lambdify")),
+            ("sympy.core", ("sympify", "S")),
+            ("sympy.core.sympify", ("sympify", "kernS")),
+            ("sympy.parsing.sympy_parser", ("parse_expr", "eval_expr", "sympify")),
+            ("sympy.utilities.lambdify", ("lambdify",)),
+        )
+        for member in members
+    ],
 ]
 
 # NumPy's array readers are safe by default, but allow_pickle=True enables
@@ -364,6 +390,12 @@ DANGEROUS_IMPORTS: set[str] = {
     "codeop",
     "compileall",
     "importlib",
+    "pkgutil",
+    # Frozen importlib aliases and ZIP loaders execute code outside this AST.
+    "_frozen_importlib",
+    "_frozen_importlib_external",
+    "zipimport",
+    "zipfile",
     # These helpers expose live frames, arbitrary source files, or raw file readers.
     "inspect",
     "linecache",
@@ -418,6 +450,12 @@ DANGEROUS_IMPORTS: set[str] = {
     # module; the whole module is blocked, same as shutil. Components must
     # use Langflow's File components for file access.
     "pathlib",
+    # SQL can write files, load extensions, and issue network requests.
+    "duckdb",
+    "_duckdb",
+    # SQLite connections can load native extensions.
+    "sqlite3",
+    "_sqlite3",
 }
 
 # Dangerous *submodules* of packages that also expose safe siblings. Block the
@@ -431,6 +469,8 @@ DANGEROUS_SUBMODULES: tuple[str, ...] = (
     "urllib.error",
     "http.client",
     "http.server",
+    # Components can log messages without configuring process-wide logging.
+    "logging.config",
     # NumPy's native-library helpers expose the otherwise blocked ctypes module.
     "numpy.ctypeslib",
     # All useful members of this module are pickle entry points or re-exports
@@ -484,6 +524,7 @@ RESTRICTED_IMPORT_NAMES: dict[str, set[str]] = {
     # Filesystem openers behind stdlib modules that otherwise stay importable.
     "io": {"open", "open_code", "FileIO"},
     "codecs": {"open"},
+    "operator": {"attrgetter", "methodcaller"},
     # `from yaml import UnsafeLoader` style imports: same deserialization RCE
     # as the dotted attribute reads blocked above.
     "yaml": {
@@ -900,6 +941,7 @@ _RESTRICTED_MODULE_REEXPORTS: dict[str, dict[str, str]] = {
     "pathlib": {"os": "os", "sys": "sys"},
     "platform": {"os": "os", "sys": "sys"},
     "tempfile": {"_os": "os", "_sys": "sys"},
+    "unittest.mock": {"pkgutil": "pkgutil"},
 }
 
 # Stdlib reexports retain the original module's restrictions. For example,
@@ -2070,6 +2112,20 @@ class _SecurityChecker(ast.NodeVisitor):
             self._escaping_names = enclosing_escaping_names
             self._restore_alias_state(enclosing_state)
         self._bind_name(node.name, frozenset())
+
+    def visit_MatchClass(self, node: ast.MatchClass):
+        """Require explicit permitted attributes in class patterns."""
+        # Positional patterns resolve attributes through the pattern class's assignable __match_args__.
+        # Relaxing this guard also requires restricting those assignments.
+        if node.patterns:
+            self.violations.append(
+                "Positional class patterns are not allowed in saved Python Interpreter, Python REPL, "
+                "or Lambda Filter code. Use keyword patterns with named attributes instead."
+            )
+        for attr in node.kwd_attrs:
+            if _is_blocked_attribute(attr):
+                self.violations.append(f"Access to '{attr}' is forbidden in components (sandbox escape)")
+        return self.generic_visit(node)
 
     def visit_Attribute(self, node: ast.Attribute):
         """Check attribute access: dunder escapes, os.environ, urllib.request, ..."""
